@@ -909,3 +909,4 @@ If output is 0 or file not found — IMA GRUB parameter from Day 3 didn't apply.
 If output is any number above 0 — good to go. Run:
 bashsudo python3 /opt/trustgate/tpm_monitor.py
 What does the IMA line count show?
+**sudo bash -c '> /opt/trustgate/pending_approval.txt'**
