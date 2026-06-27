@@ -1,0 +1,40 @@
+{
+  "plant_name": "TrustGate Water Treatment Facility",
+  "topology": "SWaT-derived 6-stage process",
+  "stages": {
+    "stage_1": {
+      "name": "Raw Water Intake",
+      "components": ["T101", "MV101", "P101", "FIT101", "LIT101"]
+    },
+    "stage_2": {
+      "name": "Pre-Treatment / Chemical Dosing",
+      "components": ["P201", "P202", "AIT201", "AIT202"]
+    },
+    "stage_3": {
+      "name": "Ultrafiltration",
+      "components": ["T301", "MV301", "MV302", "MV303", "P301", "FIT301", "DPIT301"]
+    },
+    "stage_4": {
+      "name": "De-Chlorination / RO Feed",
+      "components": ["T401", "P401", "AIT401", "AIT402", "FIT401", "LIT401"]
+    },
+    "stage_5": {
+      "name": "Reverse Osmosis",
+      "components": ["P501", "P502", "AIT501", "AIT502", "AIT503", "FIT501"]
+    },
+    "stage_6": {
+      "name": "Backwash / Distribution",
+      "components": ["T601", "MV601", "P601", "FIT601", "LIT601"]
+    }
+  },
+  "tanks":            ["T101", "T301", "T401", "T601"],
+  "pumps":            ["P101", "P201", "P202", "P301", "P401", "P501", "P502", "P601"],
+  "valves":           ["MV101", "MV301", "MV302", "MV303", "MV601"],
+  "analyzers":        ["AIT201", "AIT202", "AIT401", "AIT402", "AIT501", "AIT502", "AIT503"],
+  "flow_meters":      ["FIT101", "FIT301", "FIT401", "FIT501", "FIT601"],
+  "level_sensors":    ["LIT101", "LIT401", "LIT601"],
+  "pressure_sensors": ["DPIT301"],
+  "zero_shot_targets": ["MV302", "MV303", "AIT402"],
+  "modbus_port": 5020,
+  "protocol": "Modbus TCP"
+}
