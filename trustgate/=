@@ -1,0 +1,7 @@
+import re
+code = open('finetune_v4.py').read()
+print('W_IMP=0.30:', 'W_IMP         = 0.30' in code)
+print('W_ENT=0.10:', 'W_ENT         = 0.10' in code)
+print('LR_ENCODER=5e-6:', 'LR_ENCODER    = 5e-6' in code)
+print('entropy_reg:', 'entropy_regularization' in code)
+print('loss_ent:', 'loss_ent' in code)

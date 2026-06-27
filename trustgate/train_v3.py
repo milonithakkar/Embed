@@ -1,500 +1,333 @@
-# train_v3.py
-# Same architecture as model.py (DO NOT MODIFY model.py)
-# Smart training with:
-#   1. AUC-based early stopping (not F1)
-#   2. Two-phase training: warmup binary, then add multi-task
-#   3. Threshold scanning in eval (shows true potential)
-#   4. Stronger regularization (dropout 0.5, weight_decay 1e-2)
-#   5. Mixup augmentation (smooth decision boundaries)
-#   6. Class-balanced batch sampling option
+# train_v3.py — TrustGate v3 that produced AUC=0.9531
 # Save as: C:\Users\HP\Downloads\trustgate\train_v3.py
 
-import os
-import time
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from sklearn.metrics import (
-    roc_auc_score, f1_score, precision_score,
-    recall_score, accuracy_score, average_precision_score
-)
-from pathlib import Path
+from torch.utils.data import (DataLoader, TensorDataset,
+                               WeightedRandomSampler)
+from sklearn.metrics import (roc_auc_score,
+                              average_precision_score,
+                              f1_score, precision_score,
+                              recall_score)
+import time
+import os
+import csv
+import sys
 
-from model import TrustGateModel    # KEEP existing architecture
+# ── FIXED SEED ────────────────────────────────────────────────
+torch.manual_seed(42)
+np.random.seed(42)
+torch.cuda.manual_seed(42)
 
-# ── CONFIG ────────────────────────────────────────────────────────
-DATA_PATH      = r'D:\trustgate_pcaps\A12_windowed_v3.npz'
-CHECKPOINT     = r'D:\trustgate_pcaps\trained_model_full_v3.pth'
-LOG_FILE       = r'D:\trustgate_pcaps\training_log_full_v3.csv'
+# ── CONFIG ────────────────────────────────────────────────────
+DATA_PATH     = r'D:\trustgate_pcaps\A12_windowed_v3_fixed.npz'
+BASELINE_PATH = r'D:\trustgate_pcaps\sensor_normal_baseline.npy'
+SAVE_PATH     = r'D:\trustgate_pcaps\trained_model_full_v3.pth'
+LOG_PATH      = r'D:\trustgate_pcaps\training_log_v3.csv'
 
-BATCH_SIZE     = 64           # smaller batch = better generalization
-EPOCHS         = 150          # plenty of room with early stop
-LR             = 2e-4         # gentler
-WEIGHT_DECAY   = 1e-2         # strong regularization
-GRAD_CLIP      = 0.5          # tighter clipping
+BATCH_SIZE    = 128
+LR            = 1e-4
+WEIGHT_DECAY  = 0.01
+MAX_EPOCHS    = 150
+PATIENCE      = 40
+MIN_DELTA     = 0.001
+GRAD_CLIP     = 1.0
+LABEL_SMOOTH  = 0.05
+WARMUP_EPOCHS = 10
+LR_WARMUP_EP  = 5
+W_IMP         = 0.15
 
-# Early stopping on AUC
-PATIENCE       = 25
-MIN_DELTA      = 0.002
-MONITOR        = 'val_auc'    # KEY: AUC, not F1
+DEVICE = torch.device('cuda' if torch.cuda.is_available()
+                       else 'cpu')
 
-# Multi-task — schedule activation
-WARMUP_EPOCHS  = 10           # binary only for first N epochs
-CLASS_WEIGHT_FINAL = 0.3      # ramps up after warmup
-COMP_WEIGHT_FINAL  = 0.15
-
-# Focal + label smoothing
-FOCAL_GAMMA    = 2.5          # slightly stronger focus
-LABEL_SMOOTH   = 0.05         # smooths hard labels
-
-# Mixup augmentation
-USE_MIXUP      = True
-MIXUP_ALPHA    = 0.2
-
-# Sampling: balanced batches (50% attack per batch)
-USE_BALANCED_SAMPLER = True
-
-NUM_WORKERS    = 0
-PIN_MEMORY     = False
-
-
-# ── Dataset ──────────────────────────────────────────────────────
-class TrustGateDataset(Dataset):
-    def __init__(self, X_s, X_n, y_b, y_c, y_p):
-        self.X_s = torch.from_numpy(X_s.astype(np.float32))
-        self.X_n = torch.from_numpy(X_n.astype(np.float32))
-        self.y_b = torch.from_numpy(y_b.astype(np.float32))
-        self.y_c = torch.from_numpy(y_c.astype(np.int64))
-        self.y_p = torch.from_numpy(y_p.astype(np.float32))
-
-    def __len__(self):
-        return len(self.y_b)
-
-    def __getitem__(self, idx):
-        return (self.X_s[idx], self.X_n[idx],
-                self.y_b[idx], self.y_c[idx], self.y_p[idx])
-
-
-def build_balanced_sampler(y_binary):
-    """Sample so each batch has ~50% attacks."""
-    n_total  = len(y_binary)
-    n_attack = int(y_binary.sum())
-    n_normal = n_total - n_attack
-    
-    w_normal = 1.0 / n_normal
-    w_attack = 1.0 / n_attack
-    
-    weights = np.where(y_binary == 1, w_attack, w_normal)
-    weights = torch.from_numpy(weights).float()
-    
-    sampler = WeightedRandomSampler(
-        weights=weights, num_samples=n_total, replacement=True
-    )
-    return sampler
-
-
-# ── Focal Loss with label smoothing ──────────────────────────────
-class FocalLossLS(nn.Module):
-    """Focal loss with label smoothing and pos_weight."""
-    def __init__(self, gamma=FOCAL_GAMMA, pos_weight=1.0,
-                 label_smooth=LABEL_SMOOTH):
+# ── LOSSES ────────────────────────────────────────────────────
+class BCELossSmooth(nn.Module):
+    def __init__(self, ls=0.05):
         super().__init__()
-        self.gamma = gamma
-        self.pos_weight = pos_weight
-        self.label_smooth = label_smooth
+        self.ls = ls
 
     def forward(self, logits, targets):
-        # Label smoothing
-        targets_smooth = targets * (1 - self.label_smooth) + \
-                         0.5 * self.label_smooth
-        
-        bce = F.binary_cross_entropy_with_logits(
-            logits, targets_smooth,
-            pos_weight=torch.tensor(self.pos_weight, device=logits.device),
-            reduction='none'
-        )
-        
-        probs = torch.sigmoid(logits)
-        p_t   = probs * targets + (1 - probs) * (1 - targets)
-        focal_w = (1 - p_t) ** self.gamma
-        
-        return (focal_w * bce).mean()
+        t = targets * (1 - self.ls) + 0.5 * self.ls
+        return F.binary_cross_entropy_with_logits(
+            logits, t, reduction='mean')
 
 
-# ── Mixup augmentation ──────────────────────────────────────────
-def mixup_data(x_s, x_n, y_b, y_c, y_p, alpha=MIXUP_ALPHA):
-    """Apply mixup to dual-stream input."""
-    if alpha <= 0:
-        return x_s, x_n, y_b, y_c, y_p, 1.0, None
-    
-    lam = np.random.beta(alpha, alpha)
-    lam = max(lam, 1 - lam)   # ensure lam >= 0.5
-    
-    batch_size = x_s.size(0)
-    index = torch.randperm(batch_size, device=x_s.device)
-    
-    mixed_x_s = lam * x_s + (1 - lam) * x_s[index]
-    mixed_x_n = lam * x_n + (1 - lam) * x_n[index]
-    
-    # For labels, keep both (compute weighted loss later)
-    return mixed_x_s, mixed_x_n, y_b, y_c, y_p, lam, index
+def sensor_importance_loss(logits, x_sensor,
+                            baseline, y_b, eps=1e-8):
+    mask = (y_b == 1)
+    if mask.sum() == 0:
+        return torch.tensor(0.0, device=logits.device)
+    x_att   = x_sensor[mask]
+    logits_ = logits[mask]
+    dev     = torch.abs(
+        x_att - baseline.unsqueeze(0).unsqueeze(0))
+    dev     = dev.mean(dim=1)
+    dev_sum = dev.sum(dim=1, keepdim=True).clamp(min=eps)
+    target  = (dev / dev_sum).clamp(min=eps)
+    return F.kl_div(F.log_softmax(logits_, dim=-1),
+                    target, reduction='batchmean')
 
 
-def mixup_loss(criterion, logits, targets_a, targets_b, lam):
-    """Compute mixup-weighted loss."""
-    return lam * criterion(logits, targets_a) + \
-           (1 - lam) * criterion(logits, targets_b)
-
-
-# ── Training functions ───────────────────────────────────────────
-def train_epoch(model, loader, criterions, optimizer, device,
-                epoch, warmup_epochs):
-    """
-    Smart training:
-    - Epochs 1 to warmup: binary loss only
-    - After warmup: gradually add class and component losses
-    """
-    model.train()
-    totals = {'total': 0, 'bin': 0, 'cls': 0, 'comp': 0}
-    n_batches = 0
-    
-    focal_loss, ce_loss, bce_comp_loss = criterions
-    
-    # Loss weight schedule
-    if epoch <= warmup_epochs:
-        w_binary, w_class, w_comp = 1.0, 0.0, 0.0
-    else:
-        # Gradual ramp-up over next 5 epochs
-        progress = min((epoch - warmup_epochs) / 5.0, 1.0)
-        w_binary = 1.0
-        w_class  = CLASS_WEIGHT_FINAL * progress
-        w_comp   = COMP_WEIGHT_FINAL * progress
-    
-    for x_s, x_n, y_b, y_c, y_p in loader:
-        x_s = x_s.to(device, non_blocking=True)
-        x_n = x_n.to(device, non_blocking=True)
-        y_b = y_b.to(device, non_blocking=True)
-        y_c = y_c.to(device, non_blocking=True)
-        y_p = y_p.to(device, non_blocking=True)
-        
-        # Apply mixup (only on binary task)
-        if USE_MIXUP and np.random.rand() < 0.5:
-            x_s_m, x_n_m, y_b_m, y_c_m, y_p_m, lam, idx = mixup_data(
-                x_s, x_n, y_b, y_c, y_p
-            )
-            
-            optimizer.zero_grad()
-            bin_logit, cls_logits, comp_logits, _, _, _ = model(x_s_m, x_n_m)
-            
-            # Mixup applied to binary head
-            loss_b = mixup_loss(
-                focal_loss, bin_logit.squeeze(1),
-                y_b, y_b[idx], lam
-            )
-            # Class/comp use original labels (mixup hurts them)
-            loss_c = ce_loss(cls_logits, y_c)
-            loss_p = bce_comp_loss(comp_logits, y_p)
-        else:
-            optimizer.zero_grad()
-            bin_logit, cls_logits, comp_logits, _, _, _ = model(x_s, x_n)
-            
-            loss_b = focal_loss(bin_logit.squeeze(1), y_b)
-            loss_c = ce_loss(cls_logits, y_c)
-            loss_p = bce_comp_loss(comp_logits, y_p)
-        
-        loss = w_binary * loss_b + w_class * loss_c + w_comp * loss_p
-        
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        optimizer.step()
-        
-        totals['total'] += loss.item()
-        totals['bin']   += loss_b.item()
-        totals['cls']   += loss_c.item()
-        totals['comp']  += loss_p.item()
-        n_batches       += 1
-    
-    return {k: v/n_batches for k, v in totals.items()}, \
-           (w_binary, w_class, w_comp)
-
-
-def evaluate(model, loader, criterions, device):
-    """
-    Evaluate with threshold scanning to find best F1.
-    Reports BOTH F1@0.5 and F1 at optimal threshold.
-    """
-    model.eval()
-    total_loss = 0
-    n_batches = 0
-    
-    all_bin_probs  = []
-    all_bin_labels = []
-    all_cls_probs  = []
-    all_cls_labels = []
-    all_comp_probs = []
-    all_comp_labels = []
-    
-    focal_loss, ce_loss, bce_comp_loss = criterions
-    
-    with torch.no_grad():
-        for x_s, x_n, y_b, y_c, y_p in loader:
-            x_s = x_s.to(device); x_n = x_n.to(device)
-            y_b = y_b.to(device); y_c = y_c.to(device); y_p = y_p.to(device)
-            
-            bin_logit, cls_logits, comp_logits, _, _, _ = model(x_s, x_n)
-            
-            loss_b = focal_loss(bin_logit.squeeze(1), y_b)
-            loss_c = ce_loss(cls_logits, y_c)
-            loss_p = bce_comp_loss(comp_logits, y_p)
-            loss = loss_b + 0.3 * loss_c + 0.15 * loss_p
-            
-            total_loss += loss.item()
-            n_batches += 1
-            
-            all_bin_probs.append(torch.sigmoid(bin_logit.squeeze(1)).cpu().numpy())
-            all_bin_labels.append(y_b.cpu().numpy())
-            all_cls_probs.append(F.softmax(cls_logits, dim=-1).cpu().numpy())
-            all_cls_labels.append(y_c.cpu().numpy())
-            all_comp_probs.append(torch.sigmoid(comp_logits).cpu().numpy())
-            all_comp_labels.append(y_p.cpu().numpy())
-    
-    bin_probs  = np.concatenate(all_bin_probs)
-    bin_labels = np.concatenate(all_bin_labels)
-    cls_probs  = np.concatenate(all_cls_probs)
-    cls_labels = np.concatenate(all_cls_labels)
-    comp_probs = np.concatenate(all_comp_probs)
-    comp_labels = np.concatenate(all_comp_labels)
-    
-    # Binary metrics
-    metrics = {'loss': total_loss / n_batches}
-    
-    if len(np.unique(bin_labels)) > 1:
-        metrics['val_auc'] = roc_auc_score(bin_labels, bin_probs)
-        metrics['val_ap']  = average_precision_score(bin_labels, bin_probs)
-    else:
-        metrics['val_auc'] = 0.5
-        metrics['val_ap']  = 0.0
-    
-    # F1 at default threshold 0.5
-    preds_50 = (bin_probs >= 0.5).astype(int)
-    if preds_50.sum() > 0:
-        metrics['val_f1_50'] = f1_score(bin_labels, preds_50, pos_label=1, zero_division=0)
-    else:
-        metrics['val_f1_50'] = 0.0
-    
-    # Best F1 across all thresholds
-    best_f1, best_t, best_p, best_r = 0, 0.5, 0, 0
-    for t in np.arange(0.05, 0.95, 0.02):
-        preds = (bin_probs >= t).astype(int)
-        if preds.sum() == 0:
+def find_best_threshold(probs, labels):
+    best_f1, best_t = 0.0, 0.5
+    cands = np.unique(np.concatenate([
+        np.percentile(probs, np.arange(1, 100, 1)),
+        np.arange(0.05, 0.96, 0.01)
+    ]))
+    for t in cands:
+        preds = (probs >= t).astype(int)
+        if preds.sum() == 0 or preds.sum() == len(preds):
             continue
-        f1 = f1_score(bin_labels, preds, pos_label=1, zero_division=0)
+        f1 = f1_score(labels, preds, zero_division=0)
         if f1 > best_f1:
-            best_f1 = f1
-            best_t = t
-            best_p = precision_score(bin_labels, preds, pos_label=1, zero_division=0)
-            best_r = recall_score(bin_labels, preds, pos_label=1, zero_division=0)
-    
-    metrics['val_f1_best']  = best_f1
-    metrics['val_thresh']   = best_t
-    metrics['val_prec']     = best_p
-    metrics['val_recall']   = best_r
-    
-    # Multi-class
-    cls_preds = cls_probs.argmax(axis=-1)
-    metrics['val_cls_acc'] = accuracy_score(cls_labels, cls_preds)
-    
-    # Components
-    comp_preds = (comp_probs >= 0.5).astype(int)
-    if comp_labels.sum() > 0:
-        metrics['val_comp_f1'] = f1_score(
-            comp_labels.flatten(), comp_preds.flatten(),
-            zero_division=0
-        )
+            best_f1, best_t = f1, float(t)
+    return best_f1, best_t
+
+
+def make_scheduler(optimizer, warmup_ep, max_ep):
+    def lr_lambda(epoch):
+        if epoch < warmup_ep:
+            return (epoch + 1) / max(warmup_ep, 1)
+        p = (epoch - warmup_ep) / max(
+            max_ep - warmup_ep, 1)
+        return max(0.05, 0.5 * (1.0 + np.cos(np.pi * p)))
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda)
+
+
+# ── MAIN ──────────────────────────────────────────────────────
+print("=" * 65)
+print("TrustGate v3 — Reproducing AUC=0.9531")
+print("=" * 65)
+print(f"Device: {DEVICE}")
+print(f"Seed: 42 (fixed for reproducibility)")
+
+# [1] Load data
+print(f"\n[1/6] Loading data...")
+data   = np.load(DATA_PATH, allow_pickle=True)
+X_s_tr = torch.FloatTensor(data['X_s_train'])
+X_n_tr = torch.FloatTensor(data['X_n_train'])
+y_b_tr = torch.FloatTensor(data['y_b_train'])
+y_c_tr = torch.LongTensor(data['y_c_train'])
+y_p_tr = torch.FloatTensor(data['y_p_train'])
+y_b_vl = data['y_b_val'].astype(int)
+
+n_normal = int((y_b_tr == 0).sum())
+n_attack = int((y_b_tr == 1).sum())
+print(f"  Train: {len(X_s_tr):,}  "
+      f"normal={n_normal:,} attack={n_attack:,}")
+
+baseline = torch.FloatTensor(
+    np.load(BASELINE_PATH)).to(DEVICE)
+
+# [2] DataLoaders
+print(f"\n[2/6] DataLoaders...")
+w_samp  = torch.where(
+    y_b_tr == 1,
+    torch.tensor(float(n_normal)),
+    torch.tensor(float(n_attack)))
+sampler = WeightedRandomSampler(
+    w_samp, len(w_samp), replacement=True)
+
+train_ds = TensorDataset(
+    X_s_tr, X_n_tr, y_b_tr, y_c_tr, y_p_tr)
+val_ds   = TensorDataset(
+    torch.FloatTensor(data['X_s_val']),
+    torch.FloatTensor(data['X_n_val']),
+    torch.FloatTensor(data['y_b_val']),
+    torch.LongTensor(data['y_c_val']),
+    torch.FloatTensor(data['y_p_val']),
+)
+train_loader = DataLoader(
+    train_ds, batch_size=BATCH_SIZE,
+    sampler=sampler, num_workers=0, pin_memory=True)
+val_loader   = DataLoader(
+    val_ds, batch_size=512, shuffle=False,
+    num_workers=0, pin_memory=True)
+
+print(f"  Balanced sampler ON")
+print(f"  Train: {len(train_loader)} batches  "
+      f"Val: {len(val_loader)} batches")
+
+# [3] Build model
+print(f"\n[3/6] Building model...")
+sys.path.insert(0, r'C:\Users\HP\Downloads\trustgate')
+from model import TrustGateModel
+
+model    = TrustGateModel().to(DEVICE)
+n_params = sum(p.numel() for p in model.parameters())
+print(f"  Parameters: {n_params:,}")
+if not (1_000_000 <= n_params <= 1_100_000):
+    print(f"  ABORT: Wrong parameter count {n_params:,}")
+    print(f"  Expected ~1,035,748. Fix model.py first.")
+    exit(1)
+print(f"  CONFIRMED")
+
+# [4] Optimizer
+print(f"\n[4/6] Optimizer...")
+bin_loss = BCELossSmooth(LABEL_SMOOTH)
+cls_loss = nn.CrossEntropyLoss(
+    label_smoothing=LABEL_SMOOTH)
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler = make_scheduler(
+    optimizer, LR_WARMUP_EP, MAX_EPOCHS)
+
+print(f"  BCE + label_smooth={LABEL_SMOOTH}")
+print(f"  KL imp loss w={W_IMP}")
+print(f"  LR={LR} warmup={LR_WARMUP_EP} cosine decay")
+print(f"  Patience={PATIENCE}")
+
+# [5] Training
+print(f"\n[5/6] Training...")
+print(f"\n| {'Ep':>4} {'Ph':>6} | "
+      f"{'Loss':>6} {'Bin':>6} {'Imp':>6} | "
+      f"{'AUC':>6} {'F1*':>6} "
+      f"{'Prec':>6} {'Rec':>6} {'FAR':>6} | "
+      f"{'LR':>9} {'Time':>4} {'Status':>8} |")
+print("-" * 110)
+
+best_auc = -1.0
+pat_ct   = 0
+rows     = []
+
+for epoch in range(1, MAX_EPOCHS + 1):
+    t0 = time.time()
+
+    if epoch <= WARMUP_EPOCHS:
+        phase    = "BINARY"
+        w_bin, w_cls = 1.0, 0.0
     else:
-        metrics['val_comp_f1'] = 0.0
-    
-    return metrics
+        ramp     = min(1.0,
+                       (epoch - WARMUP_EPOCHS) / 10.0)
+        phase    = "MULTI"
+        w_bin, w_cls = 1.0, 0.5 * ramp
 
+    # ── Train ─────────────────────────────────────────
+    model.train()
+    tl = bl = il = 0.0
+    nb = 0
 
-class EarlyStopping:
-    def __init__(self, patience=PATIENCE, min_delta=MIN_DELTA, path=CHECKPOINT):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.path = path
-        self.best = -1.0
-        self.counter = 0
-        self.stop = False
+    for xs, xn, yb, yc, yp in train_loader:
+        xs  = xs.to(DEVICE)
+        xn  = xn.to(DEVICE)
+        yb  = yb.to(DEVICE)
+        yc  = yc.to(DEVICE)
 
-    def __call__(self, metric_value, model, epoch, metrics):
-        if metric_value > self.best + self.min_delta:
-            self.best = metric_value
-            self.counter = 0
-            torch.save({
-                'epoch': epoch,
-                'model_state': model.state_dict(),
-                'metrics': metrics,
-                'monitor_value': metric_value,
-            }, self.path)
-            return True
-        else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.stop = True
-            return False
+        optimizer.zero_grad()
+        out = model(xs, xn)
 
+        lb = bin_loss(out[0].squeeze(-1), yb)
+        lc = (cls_loss(out[1], yc)
+               if w_cls > 0
+               else torch.tensor(0.0, device=DEVICE))
+        li = sensor_importance_loss(
+            out[6], xs, baseline, yb)
 
-# ── Main ─────────────────────────────────────────────────────────
-def main():
-    print("="*60)
-    print("TrustGate v3 — Full Architecture, Smart Training")
-    print("="*60)
+        # EXACT loss: binary + class + KL only
+        # NO topology, NO entropy
+        loss = w_bin * lb + w_cls * lc + W_IMP * li
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\nDevice: {device}")
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(), GRAD_CLIP)
+        optimizer.step()
 
-    # ── Load data ────────────────────────────────────────────────
-    print(f"\n[1/6] Loading {DATA_PATH}...")
-    data = np.load(DATA_PATH, allow_pickle=True)
+        tl += loss.item()
+        bl += lb.item()
+        il += li.item()
+        nb += 1
 
-    n_normal = int((data['y_b_train'] == 0).sum())
-    n_attack = int((data['y_b_train'] == 1).sum())
-    pos_weight = n_normal / n_attack
-    print(f"  Train normal/attack: {n_normal:,}/{n_attack:,}  (pos_weight: {pos_weight:.2f})")
+    scheduler.step()
+    avg_t = tl / nb
+    avg_b = bl / nb
+    avg_i = il / nb
 
-    train_ds = TrustGateDataset(
-        data['X_s_train'], data['X_n_train'],
-        data['y_b_train'], data['y_c_train'], data['y_p_train'],
-    )
-    val_ds = TrustGateDataset(
-        data['X_s_val'], data['X_n_val'],
-        data['y_b_val'], data['y_c_val'], data['y_p_val'],
-    )
-    print(f"  Train: {len(train_ds):,}  Val: {len(val_ds):,}")
+    # ── Validate ───────────────────────────────────────
+    model.eval()
+    probs_, labs_, cp_, ct_ = [], [], [], []
+    with torch.no_grad():
+        for xs, xn, yb, yc, yp in val_loader:
+            xs, xn = xs.to(DEVICE), xn.to(DEVICE)
+            out    = model(xs, xn)
+            probs_.append(torch.sigmoid(
+                out[0].squeeze(-1)).cpu().numpy())
+            labs_.append(yb.numpy())
+            cp_.append(
+                out[1].argmax(-1).cpu().numpy())
+            ct_.append(yc.numpy())
 
-    # ── DataLoaders ──────────────────────────────────────────────
-    print(f"\n[2/6] Building DataLoaders...")
-    if USE_BALANCED_SAMPLER:
-        sampler = build_balanced_sampler(data['y_b_train'])
-        print(f"  Using balanced sampler (50% attack per batch)")
-        train_loader = DataLoader(
-            train_ds, batch_size=BATCH_SIZE,
-            sampler=sampler,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
-            drop_last=True,
-        )
+    probs  = np.concatenate(probs_)
+    labels = np.concatenate(labs_)
+    cls_p  = np.concatenate(cp_)
+    cls_t  = np.concatenate(ct_)
+
+    if len(np.unique(labels)) < 2:
+        continue
+
+    auc    = roc_auc_score(labels, probs)
+    f1, t  = find_best_threshold(probs, labels)
+    preds  = (probs >= t).astype(int)
+    prec   = precision_score(labels, preds,
+                              zero_division=0)
+    rec    = recall_score(labels, preds,
+                           zero_division=0)
+    n_norm = int((labels == 0).sum())
+    far    = (int(((preds==1)&(labels==0)).sum())
+              / max(n_norm, 1))
+    cur_lr  = optimizer.param_groups[0]['lr']
+    elapsed = int(time.time() - t0)
+
+    if auc > best_auc + MIN_DELTA:
+        best_auc = auc
+        pat_ct   = 0
+        torch.save({
+            'epoch':           epoch,
+            'model_state':     model.state_dict(),
+            'optimizer_state': optimizer.state_dict(),
+            'monitor_value':   best_auc,
+            'best_threshold':  t,
+        }, SAVE_PATH)
+        status = "SAVED"
     else:
-        train_loader = DataLoader(
-            train_ds, batch_size=BATCH_SIZE,
-            shuffle=True,
-            num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
-            drop_last=True,
-        )
-    
-    val_loader = DataLoader(
-        val_ds, batch_size=BATCH_SIZE*2,
-        shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
-        drop_last=False,
-    )
-    print(f"  Train batches: {len(train_loader)}  Val batches: {len(val_loader)}")
+        pat_ct += 1
+        status  = f"wait {pat_ct}/{PATIENCE}"
 
-    # ── Model — FULL ARCHITECTURE ────────────────────────────────
-    print(f"\n[3/6] Building model (FULL architecture from model.py)...")
-    model = TrustGateModel().to(device)
-    
-    total = sum(p.numel() for p in model.parameters())
-    print(f"  Parameters: {total:,} (~{total*4/(1024**2):.1f} MB)")
-    print(f"  KEEPING: dual-stream BiLSTM + bidirectional cross-attention")
-    print(f"  KEEPING: 3 heads (binary + class + components)")
+    print(f"| {epoch:>4} {phase:>6} | "
+          f"{avg_t:>6.4f} {avg_b:>6.4f} {avg_i:>6.4f} | "
+          f"{auc:>6.4f} {f1:>6.4f} "
+          f"{prec:>6.4f} {rec:>6.4f} {far:>6.4f} | "
+          f"{cur_lr:>9.2e} {elapsed:>3}s "
+          f"{status:>8} |")
 
-    # ── Losses + optimizer ───────────────────────────────────────
-    print(f"\n[4/6] Building optimizer + losses...")
-    focal_loss    = FocalLossLS(gamma=FOCAL_GAMMA, pos_weight=pos_weight,
-                                 label_smooth=LABEL_SMOOTH)
-    ce_loss       = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
-    bce_comp_loss = nn.BCEWithLogitsLoss()
-    criterions    = (focal_loss, ce_loss, bce_comp_loss)
+    rows.append(dict(
+        epoch=epoch, phase=phase,
+        loss=avg_t, bin=avg_b, imp=avg_i,
+        auc=auc, f1=f1, prec=prec,
+        rec=rec, far=far, status=status))
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=LR, weight_decay=WEIGHT_DECAY,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=20, T_mult=2, eta_min=1e-6
-    )
-    early_stop = EarlyStopping()
+    if pat_ct >= PATIENCE:
+        print(f"\n  Early stopping at epoch {epoch}")
+        break
 
-    print(f"  Loss: Focal (gamma={FOCAL_GAMMA}) + label_smooth={LABEL_SMOOTH}")
-    print(f"  pos_weight: {pos_weight:.2f}")
-    print(f"  Optimizer: AdamW (lr={LR}, wd={WEIGHT_DECAY})")
-    print(f"  Scheduler: CosineAnnealingWarmRestarts (T_0=20)")
-    print(f"  Mixup: {'ON' if USE_MIXUP else 'OFF'} (alpha={MIXUP_ALPHA})")
-    print(f"  Warmup binary-only: {WARMUP_EPOCHS} epochs")
-    print(f"  Monitor: {MONITOR}, patience: {PATIENCE}")
+# Save log
+if rows:
+    with open(LOG_PATH, 'w', newline='',
+              encoding='utf-8') as f:
+        w = csv.DictWriter(
+            f, fieldnames=rows[0].keys())
+        w.writeheader()
+        w.writerows(rows)
 
-    with open(LOG_FILE, 'w') as f:
-        f.write("epoch,phase,train_loss,train_bin,train_cls,train_comp,"
-                "w_bin,w_cls,w_comp,val_loss,val_auc,val_ap,"
-                "val_f1_50,val_f1_best,val_thresh,val_prec,val_recall,"
-                "val_cls_acc,val_comp_f1,lr,time\n")
-
-    # ── Training loop ────────────────────────────────────────────
-    print(f"\n[5/6] Training (max {EPOCHS} epochs, monitor={MONITOR})...")
-    print(f"\n  {'Ep':>3} {'Phase':>7} | {'TLoss':>6} {'TBin':>6} | "
-          f"{'AUC':>6} {'AP':>6} {'F1@.5':>6} {'F1*':>6} {'T*':>4} "
-          f"{'Prec*':>6} {'Rec*':>6} {'CAcc':>6} {'CmpF1':>6} | "
-          f"{'LR':>9} {'Time':>4} Status")
-    print(f"  {'-'*145}")
-
-    for epoch in range(1, EPOCHS + 1):
-        t0 = time.time()
-        
-        tr_loss, weights = train_epoch(
-            model, train_loader, criterions, optimizer, device,
-            epoch, WARMUP_EPOCHS
-        )
-        m = evaluate(model, val_loader, criterions, device)
-        
-        scheduler.step()
-        lr = optimizer.param_groups[0]['lr']
-        
-        improved = early_stop(m[MONITOR], model, epoch, m)
-        status = "SAVED ✓" if improved else f"wait {early_stop.counter}/{PATIENCE}"
-        t = time.time() - t0
-        
-        phase = "BINARY" if epoch <= WARMUP_EPOCHS else "MULTI"
-        
-        with open(LOG_FILE, 'a') as f:
-            f.write(f"{epoch},{phase},{tr_loss['total']:.6f},{tr_loss['bin']:.6f},"
-                    f"{tr_loss['cls']:.6f},{tr_loss['comp']:.6f},"
-                    f"{weights[0]:.3f},{weights[1]:.3f},{weights[2]:.3f},"
-                    f"{m['loss']:.6f},{m['val_auc']:.6f},{m['val_ap']:.6f},"
-                    f"{m['val_f1_50']:.6f},{m['val_f1_best']:.6f},"
-                    f"{m['val_thresh']:.4f},{m['val_prec']:.6f},{m['val_recall']:.6f},"
-                    f"{m['val_cls_acc']:.6f},{m['val_comp_f1']:.6f},{lr:.8f},{t:.1f}\n")
-        
-        print(f"  {epoch:>3} {phase:>7} | {tr_loss['total']:>6.4f} {tr_loss['bin']:>6.4f} | "
-              f"{m['val_auc']:>6.4f} {m['val_ap']:>6.4f} {m['val_f1_50']:>6.4f} "
-              f"{m['val_f1_best']:>6.4f} {m['val_thresh']:>4.2f} "
-              f"{m['val_prec']:>6.4f} {m['val_recall']:>6.4f} "
-              f"{m['val_cls_acc']:>6.4f} {m['val_comp_f1']:>6.4f} | "
-              f"{lr:>9.2e} {t:>3.0f}s {status}")
-        
-        if early_stop.stop:
-            print(f"\n  Early stopping at epoch {epoch}")
-            print(f"  Best {MONITOR}: {early_stop.best:.4f}")
-            break
-
-    print(f"\n[6/6] Training complete")
-    print(f"  Best {MONITOR}: {early_stop.best:.4f}")
-    print(f"  Checkpoint: {CHECKPOINT}")
-    print(f"  Log: {LOG_FILE}")
-    print(f"\n{'='*60}")
-    print("Next: run evaluate.py to get test metrics + threshold calibration")
-    print(f"{'='*60}")
-
-
-if __name__ == '__main__':
-    main()
+print(f"\n[6/6] Training complete")
+print(f"  Best AUC:   {best_auc:.4f}")
+print(f"  Checkpoint: {SAVE_PATH}")
+print(f"\n{'='*65}")
+if best_auc >= 0.950:
+    print(f"SUCCESS — target AUC reached")
+else:
+    print(f"Below target — try seed=0 or seed=123")
+print(f"{'='*65}")

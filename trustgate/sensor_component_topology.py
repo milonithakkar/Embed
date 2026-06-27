@@ -1,166 +1,148 @@
 # sensor_component_topology.py
-# SWaT Plant Topology: Maps 71 sensor columns → 22 component slots
-# Used for evaluating zero-shot attention attribution
+# Add this to the existing file — stage membership for locality penalty
 # Save as: C:\Users\HP\Downloads\trustgate\sensor_component_topology.py
 
-import numpy as np
+# ── STAGE MEMBERSHIP ──────────────────────────────────────────────────────────
+# Maps each sensor index to its plant stage (1-6)
+# Used for topology-constrained attention penalty
 
-# ── Component Names (22 slots, matches your NPZ) ──
-COMPONENT_NAMES = [
-    "MV101",   # Slot 0  — Stage 1 inlet valve
-    "MV201",   # Slot 1  — Stage 2 chemical valve
-    "MV301",   # Slot 2  — Stage 3 UF valve (DEAD in train)
-    "MV302",   # Slot 3  — Stage 3 UF valve (UNSEEN in train, TEST ONLY)
-    "MV303",   # Slot 4  — Stage 3 UF valve (UNSEEN in train, TEST ONLY)
-    "MV304",   # Slot 5  — Stage 3 UF valve (DEAD in train)
-    "MV501",   # Slot 6  — Stage 5 backwash valve
-    "MV502",   # Slot 7  — Stage 5 backwash valve
-    "MV503",   # Slot 8  — Stage 5 backwash valve
-    "MV504",   # Slot 9  — Stage 5 backwash valve
-    "P101",    # Slot 10 — Stage 1 raw water pump
-    "P102",    # Slot 11 — Stage 1 raw water pump (backup)
-    "P201",    # Slot 12 — Stage 2 chemical pump
-    "P202",    # Slot 13 — Stage 2 chemical pump
-    "P203",    # Slot 14 — Stage 2 chemical pump
-    "P204",    # Slot 15 — Stage 2 chemical pump
-    "P205",    # Slot 16 — Stage 2 chemical pump
-    "P206",    # Slot 17 — Stage 2 chemical pump
-    "LIT101",  # Slot 18 — Stage 1 tank level
-    "LIT601",  # Slot 19 — Stage 6 tank level
-    "DPIT301", # Slot 20 — Stage 3 differential pressure
-    "AIT402",  # Slot 21 — Stage 4 RO analyzer (UNSEEN in train, TEST ONLY)
-]
+SENSOR_STAGE = {
+    # Stage 1 — Raw Water Intake
+    0:  1,  # P1_STATE
+    1:  1,  # LIT101.Pv
+    2:  1,  # FIT101.Pv
+    3:  1,  # MV101.Status
+    4:  1,  # P101.Status
+    5:  1,  # P102.Status
 
-# ── Sensor Column Names (71 columns, from your NPZ sensor_cols) ──
-# These MUST match the exact order in your A12_windowed_v3.npz
-SENSOR_COLUMNS = [
-    # Stage 1 — Raw Water (5 sensors + 5 states = 10 cols)
-    "FIT101", "LIT101", "AIT201", "AIT202", "AIT203",
-    "MV101", "P101", "P102", "P201", "P202",
-    # Stage 2 — Chemical Dosing (10 cols)
-    "P203", "P204", "P205", "P206", "FIT201",
-    "MV201", "AIT301", "AIT302", "AIT303", "AIT304",
-    # Stage 3 — Ultrafiltration (12 cols)
-    "DPIT301", "FIT301", "LIT301", "MV301", "MV302",
-    "MV303", "MV304", "P301", "P302", "AIT401",
-    "AIT402", "AIT403",
-    # Stage 4 — Reverse Osmosis (12 cols)
-    "FIT401", "LIT401", "P401", "P402", "UV401",
-    "AIT501", "AIT502", "AIT503", "AIT504", "FIT501",
-    "FIT502", "FIT503",
-    # Stage 5 — Backwash (12 cols)
-    "FIT504", "P501", "P502", "MV501", "MV502",
-    "MV503", "MV504", "P601", "P602", "P603",
-    "LIT601", "FIT601",
-    # Stage 6 — Return (15 cols, filling to 71)
-    "AIT601", "AIT602", "AIT603", "AIT604", "AIT605",
-    "AIT606", "AIT607", "AIT608", "AIT609", "AIT610",
-    "DPIT401", "DPIT501", "DPIT601", "TEMP101", "TEMP201",
-]
+    # Stage 2 — Chemical Dosing
+    6:  2,  # P2_STATE
+    7:  2,  # FIT201.Pv
+    8:  2,  # AIT201.Pv
+    9:  2,  # AIT202.Pv
+    10: 2,  # AIT203.Pv
+    11: 2,  # MV201.Status
+    12: 2,  # P201.Status
+    13: 2,  # P202.Status
+    14: 2,  # P203.Status
+    15: 2,  # P204.Status
+    16: 2,  # P205.Status
+    17: 2,  # P206.Status
+    18: 2,  # P207.Status
+    19: 2,  # P208.Status
 
-# ── Topology Mapping: Which sensors are physically adjacent to each component ──
-# This is the GROUND TRUTH for zero-shot evaluation
-# Format: component_slot → [sensor_indices]
-# A sensor is "adjacent" if it measures flow/level/pressure directly upstream,
-# downstream, or controls the component
+    # Stage 3 — Ultrafiltration
+    20: 3,  # P3_STATE
+    21: 3,  # AIT301.Pv
+    22: 3,  # AIT302.Pv
+    23: 3,  # AIT303.Pv
+    24: 3,  # LIT301.Pv
+    25: 3,  # FIT301.Pv
+    26: 3,  # DPIT301.Pv
+    27: 3,  # MV301.Status
+    28: 3,  # MV302.Status
+    29: 3,  # MV303.Status
+    30: 3,  # MV304.Status
+    31: 3,  # P301.Status
+    32: 3,  # P302.Status
 
-COMPONENT_TO_SENSORS = {
-    # Stage 1
-    0:  [0, 1, 5],           # MV101 → FIT101, LIT101, MV101_state
-    1:  [4, 14, 15],         # MV201 → AIT203, FIT201, MV201_state
-    
-    # Stage 3 UF (UNSEEN in training — these are your zero-shot targets)
-    2:  [11, 12, 13],       # MV301 → DPIT301, FIT301, LIT301
-    3:  [11, 12, 13, 14],    # MV302 → DPIT301, FIT301, LIT301, MV302_state
-    4:  [11, 12, 13, 15],    # MV303 → DPIT301, FIT301, LIT301, MV303_state
-    5:  [11, 12, 13, 16],    # MV304 → DPIT301, FIT301, LIT301, MV304_state
-    
-    # Stage 5 Backwash
-    6:  [32, 33, 34],        # MV501 → FIT504, P501, P502 (wait, wrong)
-    # CORRECTED Stage 5 mapping:
-    6:  [43, 44, 45],        # MV501 → MV501_state, MV502_state, MV503_state (no, these are valves)
-    # Let me fix this properly based on actual SWaT topology:
-    
-    # CORRECT SWaT Stage 5: Backwash system
-    # MV501-504 are backwash valves
-    # Sensors: FIT501, FIT502, FIT503, FIT504 measure flow through these
-    6:  [29, 43],            # MV501 → FIT501, MV501_state
-    7:  [30, 44],            # MV502 → FIT502, MV502_state
-    8:  [31, 45],            # MV503 → FIT503, MV503_state
-    9:  [32, 46],            # MV504 → FIT504, MV504_state
-    
-    # Stage 1 Pumps
-    10: [0, 1, 6],           # P101 → FIT101, LIT101, P101_state
-    11: [0, 1, 7],           # P102 → FIT101, LIT101, P102_state
-    
-    # Stage 2 Pumps
-    12: [4, 8],              # P201 → AIT203, P201_state
-    13: [4, 9],              # P202 → AIT203, P202_state
-    14: [4, 10],             # P203 → AIT203, P203_state
-    15: [4, 11],             # P204 → AIT203, P204_state
-    16: [4, 12],             # P205 → AIT203, P205_state
-    17: [4, 13],             # P206 → AIT203, P206_state
-    
-    # Level sensors (these ARE components in your slot mapping)
-    18: [1],                 # LIT101 → LIT101 (self-referential, it's a sensor)
-    19: [41],                # LIT601 → LIT601 (self-referential)
-    
-    # Pressure sensor
-    20: [11],                # DPIT301 → DPIT301 (self-referential)
-    
-    # Stage 4 Analyzer (UNSEEN in training — zero-shot target)
-    21: [25],                # AIT402 → AIT402 (self-referential, but also AIT401, AIT403)
+    # Stage 4 — De-chlorination / RO
+    33: 4,  # P4_STATE
+    34: 4,  # LIT401.Pv
+    35: 4,  # FIT401.Pv
+    36: 4,  # AIT401.Pv
+    37: 4,  # AIT402.Pv
+    38: 4,  # P401.Status
+    39: 4,  # P402.Status
+    40: 4,  # P403.Status
+    41: 4,  # P404.Status
+    42: 4,  # UV401.Status
+
+    # Stage 5 — Backwash / RO membranes
+    43: 5,  # P5_STATE
+    44: 5,  # FIT501.Pv
+    45: 5,  # FIT502.Pv
+    46: 5,  # FIT503.Pv
+    47: 5,  # FIT504.Pv
+    48: 5,  # AIT501.Pv
+    49: 5,  # AIT502.Pv
+    50: 5,  # AIT503.Pv
+    51: 5,  # AIT504.Pv
+    52: 5,  # PIT501.Pv
+    53: 5,  # PIT502.Pv
+    54: 5,  # PIT503.Pv
+    55: 5,  # P501.Status
+    56: 5,  # P501.Speed
+    57: 5,  # P502.Status
+    58: 5,  # P502.Speed
+    59: 5,  # MV501.Status
+    60: 5,  # MV502.Status
+    61: 5,  # MV503.Status
+    62: 5,  # MV504.Status
+
+    # Stage 6 — Return / Storage
+    63: 6,  # P6_STATE
+    64: 6,  # LIT601.Pv
+    65: 6,  # LIT602.Pv
+    66: 6,  # FIT601.Pv
+    67: 6,  # FIT602.Pv
+    68: 6,  # P601.Status
+    69: 6,  # P602.Status
+    70: 6,  # P603.Status
 }
 
-# ── Reverse Mapping: Sensor → Which components it can help localize ──
-SENSOR_TO_COMPONENTS = {}
-for comp_slot, sensor_list in COMPONENT_TO_SENSORS.items():
-    for sensor_idx in sensor_list:
-        if sensor_idx not in SENSOR_TO_COMPONENTS:
-            SENSOR_TO_COMPONENTS[sensor_idx] = []
-        SENSOR_TO_COMPONENTS[sensor_idx].append(comp_slot)
+# ── COMPONENT STAGE MEMBERSHIP ────────────────────────────────────────────────
+# Maps each component slot to its plant stage
+COMPONENT_STAGE = {
+    0:  1,   # MV101
+    10: 1,   # P101
+    11: 1,   # P102
+    18: 1,   # LIT101
+    1:  2,   # MV201
+    12: 2,   # P201
+    13: 2,   # P202
+    14: 2,   # P203
+    15: 2,   # P204
+    16: 2,   # P205
+    17: 2,   # P206
+    2:  3,   # MV301
+    3:  3,   # MV302  ← UNSEEN
+    4:  3,   # MV303  ← UNSEEN
+    5:  3,   # MV304
+    20: 3,   # DPIT301
+    6:  5,   # MV501
+    7:  5,   # MV502
+    8:  5,   # MV503
+    9:  5,   # MV504
+    19: 6,   # LIT601
+    21: 4,   # AIT402 ← UNSEEN
+}
 
-# ── Zero-Shot Test Components ──
-UNSEEN_COMPONENTS = [3, 4, 21]   # MV302, MV303, AIT402
-SEEN_COMPONENTS = [0, 1, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+# ── BUILD STAGE SENSOR MASK ───────────────────────────────────────────────────
+# For each stage, which sensor indices belong to it
+import numpy as np
 
-def get_component_name(slot: int) -> str:
-    return COMPONENT_NAMES[slot]
+N_SENSORS = 71
+N_STAGES  = 7   # stages 1-6, index 0 unused
 
-def get_adjacent_sensors(slot: int) -> list:
-    return COMPONENT_TO_SENSORS.get(slot, [])
+STAGE_SENSOR_MASK = np.zeros((N_STAGES, N_SENSORS), dtype=np.float32)
+for sensor_idx, stage in SENSOR_STAGE.items():
+    STAGE_SENSOR_MASK[stage, sensor_idx] = 1.0
 
-def get_sensor_name(idx: int) -> str:
-    return SENSOR_COLUMNS[idx] if idx < len(SENSOR_COLUMNS) else f"sensor_{idx}"
+# ── COMPONENT TO STAGE LOOKUP ─────────────────────────────────────────────────
+def get_component_stage(comp_slot):
+    return COMPONENT_STAGE.get(comp_slot, -1)
 
-def is_unseen(slot: int) -> bool:
-    return slot in UNSEEN_COMPONENTS
+def get_stage_sensor_mask(stage):
+    """Returns binary mask (71,) — 1 for sensors in this stage, 0 otherwise."""
+    if stage < 0 or stage >= N_STAGES:
+        return np.ones(N_SENSORS, dtype=np.float32)
+    return STAGE_SENSOR_MASK[stage].copy()
 
-# ── Validation ──
 if __name__ == '__main__':
-    print("="*60)
-    print("SWaT Sensor-Component Topology Mapping")
-    print("="*60)
-    
-    print(f"\nTotal sensors: {len(SENSOR_COLUMNS)}")
-    print(f"Total components: {len(COMPONENT_NAMES)}")
-    
-    print(f"\n{'─'*60}")
-    print("UNSEEN Components (Zero-Shot Targets):")
-    print(f"{'─'*60}")
-    for slot in UNSEEN_COMPONENTS:
-        sensors = get_adjacent_sensors(slot)
-        sensor_names = [get_sensor_name(s) for s in sensors]
-        print(f"  Slot {slot:2d}: {get_component_name(slot):8s} → sensors {sensors} = {sensor_names}")
-    
-    print(f"\n{'─'*60}")
-    print("SEEN Components (Training Coverage):")
-    print(f"{'─'*60}")
-    for slot in SEEN_COMPONENTS:
-        sensors = get_adjacent_sensors(slot)
-        sensor_names = [get_sensor_name(s) for s in sensors]
-        print(f"  Slot {slot:2d}: {get_component_name(slot):8s} → sensors {sensors} = {sensor_names}")
-    
-    print(f"\n{'='*60}")
-    print("Topology mapping verified.")
-    print("="*60)
+    print("Stage sensor counts:")
+    for s in range(1, 7):
+        count = int(STAGE_SENSOR_MASK[s].sum())
+        sensors = [i for i in range(N_SENSORS)
+                   if SENSOR_STAGE.get(i) == s]
+        print(f"  Stage {s}: {count} sensors → {sensors}")

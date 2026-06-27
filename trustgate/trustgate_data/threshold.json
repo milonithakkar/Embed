@@ -1,0 +1,6 @@
+{
+  "threshold": 0.98,
+  "val_f1": 0.03872401206157753,
+  "description": "Optimal F1 threshold calibrated on val set",
+  "apply_to": "sigmoid output of attack_logit"
+}

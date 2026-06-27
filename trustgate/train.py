@@ -1,371 +1,301 @@
-# =================================================================
-# train.py v2
-# Fixed: no sampler, pos_weight focal, rebalanced multi-task
-# Save as: C:\Users\HP\Downloads\trustgate\train.py (overwrite)
-# =================================================================
+# train_v3.py — TrustGate Path B, Single Rebalancing Strategy
+# Save as: C:\Users\HP\Downloads\trustgate\train_v3.py
 
-import os
-import time
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import (
-    roc_auc_score, f1_score, precision_score,
-    recall_score, accuracy_score
-)
-from pathlib import Path
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import (roc_auc_score, average_precision_score,
+                             f1_score, precision_score, recall_score)
+import time
+import os
+import csv
 
-from model import TrustGateModel
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+DATA_PATH    = r'D:\trustgate_pcaps\A12_windowed_v3_fixed.npz'
+SAVE_PATH    = r'D:\trustgate_pcaps\trained_model_full_v3.pth'
+LOG_PATH     = r'D:\trustgate_pcaps\training_log_full_v3.csv'
 
-# ── CONFIG ────────────────────────────────────────────────────────
-DATA_PATH      = r'D:\trustgate_pcaps\A12_windowed_v3.npz'
-CHECKPOINT     = r'D:\trustgate_pcaps\trained_model_A12_v3.pth'
-LOG_FILE       = r'D:\trustgate_pcaps\training_log_A12_v3.csv'
+BATCH_SIZE   = 128
+LR           = 2e-4
+WEIGHT_DECAY = 0.01
+MAX_EPOCHS   = 150
+PATIENCE     = 30
+MIN_DELTA    = 0.001
+GRAD_CLIP    = 1.0
+LABEL_SMOOTH = 0.05
+WARMUP_EPOCHS = 15
+T_0          = 25
+MIXUP_ALPHA  = 0.1
 
-BATCH_SIZE     = 128
-EPOCHS         = 100
-LR             = 3e-4         # reduced from 5e-4
-WEIGHT_DECAY   = 5e-3         # increased from 1e-3
-GRAD_CLIP      = 1.0
+# Single rebalancing strategy: pos_weight only
+# No balanced sampler. No focal loss boosting.
+USE_BALANCED_SAMPLER = False
+FOCAL_GAMMA          = 0.0   # gamma=0 means standard BCE with pos_weight only
 
-PATIENCE       = 20           # longer patience
-MIN_DELTA      = 0.001
-MONITOR        = 'val_f1'
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Multi-task weights (rebalanced)
-LOSS_WEIGHT_BINARY = 1.0
-LOSS_WEIGHT_CLASS  = 0.2      # reduced
-LOSS_WEIGHT_COMP   = 0.1      # reduced
-
-FOCAL_GAMMA    = 2.0
-
-NUM_WORKERS    = 0
-PIN_MEMORY     = False
-
-
-# ── Dataset ──────────────────────────────────────────────────────
-class TrustGateDataset(Dataset):
-    def __init__(self, X_s, X_n, y_b, y_c, y_p):
-        self.X_s = torch.from_numpy(X_s.astype(np.float32))
-        self.X_n = torch.from_numpy(X_n.astype(np.float32))
-        self.y_b = torch.from_numpy(y_b.astype(np.float32))
-        self.y_c = torch.from_numpy(y_c.astype(np.int64))
-        self.y_p = torch.from_numpy(y_p.astype(np.float32))
-
-    def __len__(self):
-        return len(self.y_b)
-
-    def __getitem__(self, idx):
-        return (
-            self.X_s[idx], self.X_n[idx],
-            self.y_b[idx], self.y_c[idx], self.y_p[idx]
-        )
-
-
-# ── Focal Loss with pos_weight ───────────────────────────────────
-class FocalLossWithPosWeight(nn.Module):
-    """
-    Focal loss with class imbalance correction.
-    
-    pos_weight: weight for positive class (attacks)
-                Higher = harder penalty for missing attacks
-                = n_normal / n_attack (auto-calculated)
-    
-    gamma: focusing parameter (down-weight easy examples)
-           Higher = focus more on hard examples
-    """
-    def __init__(self, gamma=FOCAL_GAMMA, pos_weight=1.0):
+# ── WEIGHTED BCE LOSS (Focal with gamma=0 = standard weighted BCE) ────────────
+class WeightedBCELoss(nn.Module):
+    def __init__(self, pos_weight, label_smooth=0.05):
         super().__init__()
-        self.gamma = gamma
-        self.pos_weight = pos_weight
+        self.pos_weight   = pos_weight
+        self.label_smooth = label_smooth
 
     def forward(self, logits, targets):
-        # Base BCE with class weighting
-        bce = F.binary_cross_entropy_with_logits(
-            logits, targets,
-            pos_weight=torch.tensor(self.pos_weight,
-                                    device=logits.device),
-            reduction='none'
+        # Label smoothing
+        targets_s = targets * (1 - self.label_smooth) + 0.5 * self.label_smooth
+        loss = nn.functional.binary_cross_entropy_with_logits(
+            logits, targets_s,
+            pos_weight=self.pos_weight,
+            reduction='mean'
         )
-        
-        # Focal modulation
-        probs = torch.sigmoid(logits)
-        p_t   = probs * targets + (1 - probs) * (1 - targets)
-        focal_w = (1 - p_t) ** self.gamma
-        
-        return (focal_w * bce).mean()
+        return loss
 
+# ── MIXUP ─────────────────────────────────────────────────────────────────────
+def mixup_batch(xs, xn, yb, alpha=0.1):
+    if alpha <= 0:
+        return xs, xn, yb
+    lam = np.random.beta(alpha, alpha)
+    idx = torch.randperm(xs.size(0), device=xs.device)
+    return (lam * xs  + (1-lam) * xs[idx],
+            lam * xn  + (1-lam) * xn[idx],
+            lam * yb  + (1-lam) * yb[idx])
 
-# ── Training functions ───────────────────────────────────────────
-def train_one_epoch(model, loader, criterions, optimizer, device):
+# ── FIND OPTIMAL THRESHOLD ────────────────────────────────────────────────────
+def find_best_threshold(probs, labels):
+    best_f1, best_t = 0.0, 0.5
+    for t in np.arange(0.05, 0.96, 0.01):
+        preds = (probs >= t).astype(int)
+        if preds.sum() == 0 or preds.sum() == len(preds):
+            continue
+        f1 = f1_score(labels, preds, zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_t = f1, t
+    return best_f1, best_t
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+print("=" * 60)
+print("TrustGate v3 — Fixed Training (Single Rebalancing)")
+print("=" * 60)
+print(f"\nDevice: {device}")
+
+# [1/6] Load data
+print(f"\n[1/6] Loading {DATA_PATH}...")
+data = np.load(DATA_PATH, allow_pickle=True)
+
+X_s_tr = torch.FloatTensor(data['X_s_train'])
+X_n_tr = torch.FloatTensor(data['X_n_train'])
+y_b_tr = torch.FloatTensor(data['y_b_train'])
+y_c_tr = torch.LongTensor(data['y_c_train'])
+y_p_tr = torch.FloatTensor(data['y_p_train'])
+
+X_s_vl = torch.FloatTensor(data['X_s_val'])
+X_n_vl = torch.FloatTensor(data['X_n_val'])
+y_b_vl = data['y_b_val'].astype(int)
+y_c_vl = data['y_c_val'].astype(int)
+y_p_vl = torch.FloatTensor(data['y_p_val'])
+
+n_normal = int((y_b_tr == 0).sum())
+n_attack = int((y_b_tr == 1).sum())
+ratio    = n_normal / max(n_attack, 1)
+pos_w    = torch.tensor([ratio], device=device)
+
+print(f"  Train normal/attack: {n_normal:,}/{n_attack:,}")
+print(f"  pos_weight: {ratio:.2f}  (single rebalancing strategy)")
+print(f"  Train: {len(X_s_tr):,}  Val: {len(X_s_vl):,}")
+
+# [2/6] DataLoaders — standard shuffle, no balanced sampler
+print(f"\n[2/6] Building DataLoaders...")
+print(f"  Balanced sampler: OFF")
+print(f"  pos_weight: {ratio:.2f} handles class imbalance")
+
+train_ds = TensorDataset(X_s_tr, X_n_tr, y_b_tr, y_c_tr, y_p_tr)
+val_ds   = TensorDataset(X_s_vl, X_n_vl,
+                         torch.FloatTensor(data['y_b_val']),
+                         torch.LongTensor(data['y_c_val']),
+                         y_p_vl)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
+                          shuffle=True, num_workers=0, pin_memory=True)
+val_loader   = DataLoader(val_ds,   batch_size=512,
+                          shuffle=False, num_workers=0, pin_memory=True)
+
+print(f"  Train batches: {len(train_loader)}  Val batches: {len(val_loader)}")
+
+# [3/6] Build model
+print(f"\n[3/6] Building model...")
+import sys
+sys.path.insert(0, r'C:\Users\HP\Downloads\trustgate')
+from model import TrustGateModel
+
+model   = TrustGateModel().to(device)
+n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"  Parameters: {n_params:,}")
+
+if n_params < 800_000:
+    print(f"  ABORT: Model too small ({n_params:,}). Fix model.py first.")
+    exit(1)
+print(f"  CONFIRMED: Full architecture")
+
+# [4/6] Optimizer + losses
+print(f"\n[4/6] Building optimizer + losses...")
+
+# Single rebalancing: weighted BCE only
+bin_criterion = WeightedBCELoss(pos_w, label_smooth=LABEL_SMOOTH)
+cls_criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTH)
+
+optimizer = torch.optim.AdamW(model.parameters(),
+                               lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, T_0=T_0)
+
+print(f"  Loss: WeightedBCE (pos_weight={ratio:.2f}) — NO focal, NO sampler")
+print(f"  Label smoothing: {LABEL_SMOOTH}")
+print(f"  Optimizer: AdamW (lr={LR}, wd={WEIGHT_DECAY})")
+print(f"  Scheduler: CosineAnnealingWarmRestarts (T_0={T_0})")
+print(f"  Mixup: alpha={MIXUP_ALPHA}")
+print(f"  Warmup binary-only: {WARMUP_EPOCHS} epochs")
+print(f"  Patience: {PATIENCE}")
+
+# [5/6] Training
+print(f"\n[5/6] Training (max {MAX_EPOCHS} epochs)...")
+print(f"\n| {'Ep':>4} {'Phase':>6} | {'TLoss':>6} {'TBin':>6} | "
+      f"{'AUC':>6} {'AP':>6} {'F1@.5':>6} {'F1*':>6} "
+      f"{'T*':>5} {'Prec*':>6} {'Rec*':>6} {'CAcc':>6} | "
+      f"{'LR':>9} {'Time':>4} {'Status':>10} |")
+print("-" * 118)
+
+best_auc    = -1.0
+patience_ct = 0
+log_rows    = []
+
+for epoch in range(1, MAX_EPOCHS + 1):
+    t0 = time.time()
+
+    # Phase
+    if epoch <= WARMUP_EPOCHS:
+        phase = "BINARY"
+        w_bin, w_cls = 1.0, 0.0
+    else:
+        ramp = min(1.0, (epoch - WARMUP_EPOCHS) / 10.0)
+        phase = "MULTI"
+        w_bin, w_cls = 1.0, 0.5 * ramp
+
+    # ── Train ─────────────────────────────────────────────────
     model.train()
-    totals = {'total': 0, 'bin': 0, 'cls': 0, 'comp': 0}
-    n_batches = 0
+    total_loss = bin_loss_sum = 0.0
+    n_batches  = 0
 
-    focal_loss, ce_loss, bce_comp_loss = criterions
+    for xs, xn, yb, yc, yp in train_loader:
+        xs  = xs.to(device)
+        xn  = xn.to(device)
+        yb  = yb.to(device)
+        yc  = yc.to(device)
 
-    for x_s, x_n, y_b, y_c, y_p in loader:
-        x_s = x_s.to(device)
-        x_n = x_n.to(device)
-        y_b = y_b.to(device)
-        y_c = y_c.to(device)
-        y_p = y_p.to(device)
+        if MIXUP_ALPHA > 0 and phase == "BINARY":
+            xs, xn, yb = mixup_batch(xs, xn, yb, MIXUP_ALPHA)
 
         optimizer.zero_grad()
 
-        bin_logit, cls_logits, comp_logits, _, _, _ = model(x_s, x_n)
+        out = model(xs, xn)
+        bin_logit, cls_logits = out[0], out[1]
 
-        loss_b = focal_loss(bin_logit.squeeze(1), y_b)
-        loss_c = ce_loss(cls_logits, y_c)
-        loss_p = bce_comp_loss(comp_logits, y_p)
-
-        loss = (LOSS_WEIGHT_BINARY * loss_b
-                + LOSS_WEIGHT_CLASS  * loss_c
-                + LOSS_WEIGHT_COMP   * loss_p)
+        loss_bin = bin_criterion(bin_logit.squeeze(-1), yb)
+        loss_cls = (cls_criterion(cls_logits, yc)
+                    if w_cls > 0 else torch.tensor(0.0, device=device))
+        loss     = w_bin * loss_bin + w_cls * loss_cls
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         optimizer.step()
 
-        totals['total'] += loss.item()
-        totals['bin']   += loss_b.item()
-        totals['cls']   += loss_c.item()
-        totals['comp']  += loss_p.item()
-        n_batches       += 1
+        total_loss   += loss.item()
+        bin_loss_sum += loss_bin.item()
+        n_batches    += 1
 
-    return {k: v/n_batches for k, v in totals.items()}
+    scheduler.step()
+    avg_loss = total_loss   / n_batches
+    avg_bin  = bin_loss_sum / n_batches
 
-
-def evaluate(model, loader, criterions, device):
+    # ── Validate ──────────────────────────────────────────────
     model.eval()
-    total_loss = 0
-    n_batches  = 0
-
-    all_bin_probs   = []
-    all_bin_labels  = []
-    all_cls_probs   = []
-    all_cls_labels  = []
-    all_comp_probs  = []
-    all_comp_labels = []
-
-    focal_loss, ce_loss, bce_comp_loss = criterions
+    all_probs, all_labels = [], []
+    all_cls_pred, all_cls_true = [], []
 
     with torch.no_grad():
-        for x_s, x_n, y_b, y_c, y_p in loader:
-            x_s = x_s.to(device); x_n = x_n.to(device)
-            y_b = y_b.to(device); y_c = y_c.to(device); y_p = y_p.to(device)
+        for xs, xn, yb, yc, yp in val_loader:
+            xs, xn = xs.to(device), xn.to(device)
+            out    = model(xs, xn)
+            probs  = torch.sigmoid(out[0].squeeze(-1)).cpu().numpy()
+            all_probs.append(probs)
+            all_labels.append(yb.numpy())
+            all_cls_pred.append(out[1].argmax(-1).cpu().numpy())
+            all_cls_true.append(yc.numpy())
 
-            bin_logit, cls_logits, comp_logits, _, _, _ = model(x_s, x_n)
+    probs  = np.concatenate(all_probs)
+    labels = np.concatenate(all_labels)
+    cls_p  = np.concatenate(all_cls_pred)
+    cls_t  = np.concatenate(all_cls_true)
 
-            loss_b = focal_loss(bin_logit.squeeze(1), y_b)
-            loss_c = ce_loss(cls_logits, y_c)
-            loss_p = bce_comp_loss(comp_logits, y_p)
+    if len(np.unique(labels)) < 2:
+        print(f"  WARNING epoch {epoch}: only one class in val. Skipping.")
+        continue
 
-            loss = (LOSS_WEIGHT_BINARY * loss_b
-                    + LOSS_WEIGHT_CLASS  * loss_c
-                    + LOSS_WEIGHT_COMP   * loss_p)
-            total_loss += loss.item()
-            n_batches  += 1
+    auc      = roc_auc_score(labels, probs)
+    ap       = average_precision_score(labels, probs)
+    f1_half  = f1_score(labels, (probs >= 0.5).astype(int), zero_division=0)
+    best_f1, best_t = find_best_threshold(probs, labels)
+    preds_b  = (probs >= best_t).astype(int)
+    prec_b   = precision_score(labels, preds_b, zero_division=0)
+    rec_b    = recall_score(labels,  preds_b, zero_division=0)
+    cacc     = (cls_p == cls_t).mean()
+    cur_lr   = optimizer.param_groups[0]['lr']
+    elapsed  = int(time.time() - t0)
 
-            all_bin_probs.append(torch.sigmoid(bin_logit.squeeze(1)).cpu().numpy())
-            all_bin_labels.append(y_b.cpu().numpy())
-            all_cls_probs.append(F.softmax(cls_logits, dim=-1).cpu().numpy())
-            all_cls_labels.append(y_c.cpu().numpy())
-            all_comp_probs.append(torch.sigmoid(comp_logits).cpu().numpy())
-            all_comp_labels.append(y_p.cpu().numpy())
-
-    bin_probs  = np.concatenate(all_bin_probs)
-    bin_labels = np.concatenate(all_bin_labels)
-    cls_probs  = np.concatenate(all_cls_probs)
-    cls_labels = np.concatenate(all_cls_labels)
-    comp_probs = np.concatenate(all_comp_probs)
-    comp_labels = np.concatenate(all_comp_labels)
-
-    bin_preds = (bin_probs >= 0.5).astype(int)
-    metrics = {
-        'loss'       : total_loss / n_batches,
-        'val_auc'    : roc_auc_score(bin_labels, bin_probs) if len(np.unique(bin_labels)) > 1 else 0.5,
-        'val_f1'     : f1_score(bin_labels, bin_preds, pos_label=1, zero_division=0),
-        'val_prec'   : precision_score(bin_labels, bin_preds, pos_label=1, zero_division=0),
-        'val_recall' : recall_score(bin_labels, bin_preds, pos_label=1, zero_division=0),
-    }
-
-    cls_preds = cls_probs.argmax(axis=-1)
-    metrics['val_cls_acc'] = accuracy_score(cls_labels, cls_preds)
-
-    comp_preds = (comp_probs >= 0.5).astype(int)
-    if comp_labels.sum() > 0:
-        metrics['val_comp_f1'] = f1_score(
-            comp_labels.flatten(), comp_preds.flatten(),
-            zero_division=0
-        )
+    # ── Early stopping ─────────────────────────────────────────
+    if auc > best_auc + MIN_DELTA:
+        best_auc    = auc
+        patience_ct = 0
+        torch.save({
+            'epoch':          epoch,
+            'model_state':    model.state_dict(),
+            'optimizer_state':optimizer.state_dict(),
+            'monitor_value':  best_auc,
+            'best_threshold': best_t,
+        }, SAVE_PATH)
+        status = "SAVED ✓"
     else:
-        metrics['val_comp_f1'] = 0.0
+        patience_ct += 1
+        status = f"wait {patience_ct}/{PATIENCE}"
 
-    return metrics
+    print(f"| {epoch:>4} {phase:>6} | {avg_loss:>6.4f} {avg_bin:>6.4f} | "
+          f"{auc:>6.4f} {ap:>6.4f} {f1_half:>6.4f} {best_f1:>6.4f} "
+          f"{best_t:>5.2f} {prec_b:>6.4f} {rec_b:>6.4f} {cacc:>6.4f} | "
+          f"{cur_lr:>9.2e} {elapsed:>3}s {status:>10} |")
 
+    log_rows.append(dict(epoch=epoch, phase=phase,
+                         train_loss=avg_loss, val_auc=auc, val_ap=ap,
+                         val_f1_half=f1_half, val_f1_best=best_f1,
+                         best_threshold=best_t, val_prec=prec_b,
+                         val_rec=rec_b, class_acc=cacc,
+                         lr=cur_lr, status=status))
 
-class EarlyStopping:
-    def __init__(self, patience=PATIENCE, min_delta=MIN_DELTA, path=CHECKPOINT):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.path = path
-        self.best = -1.0
-        self.counter = 0
-        self.stop = False
+    if patience_ct >= PATIENCE:
+        print(f"\n  Early stopping at epoch {epoch}")
+        break
 
-    def __call__(self, metric_value, model, epoch, metrics_dict):
-        if metric_value > self.best + self.min_delta:
-            self.best = metric_value
-            self.counter = 0
-            torch.save({
-                'epoch': epoch,
-                'model_state': model.state_dict(),
-                'metrics': metrics_dict,
-                'val_f1': metric_value,
-            }, self.path)
-            return True
-        else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.stop = True
-            return False
+# ── Save log ──────────────────────────────────────────────────
+if log_rows:
+    with open(LOG_PATH, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=log_rows[0].keys())
+        w.writeheader()
+        w.writerows(log_rows)
 
-
-def init_log(path):
-    with open(path, 'w') as f:
-        f.write("epoch,train_loss,train_bin,train_cls,train_comp,"
-                "val_loss,val_auc,val_f1,val_prec,val_recall,"
-                "val_cls_acc,val_comp_f1,lr,time_s\n")
-
-
-def log_epoch(path, ep, tr, val, lr, t):
-    with open(path, 'a') as f:
-        f.write(f"{ep},{tr['total']:.6f},{tr['bin']:.6f},"
-                f"{tr['cls']:.6f},{tr['comp']:.6f},"
-                f"{val['loss']:.6f},{val['val_auc']:.6f},"
-                f"{val['val_f1']:.6f},{val['val_prec']:.6f},"
-                f"{val['val_recall']:.6f},{val['val_cls_acc']:.6f},"
-                f"{val['val_comp_f1']:.6f},{lr:.8f},{t:.1f}\n")
-
-
-def main():
-    print("="*60)
-    print("TrustGate v2 — Fixed Training")
-    print("="*60)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\nDevice: {device}")
-
-    print(f"\n[1/5] Loading {DATA_PATH}...")
-    data = np.load(DATA_PATH, allow_pickle=True)
-
-    # Compute pos_weight from train data
-    n_normal = int((data['y_b_train'] == 0).sum())
-    n_attack = int((data['y_b_train'] == 1).sum())
-    pos_weight_value = n_normal / n_attack
-    print(f"  n_normal: {n_normal:,}  n_attack: {n_attack:,}")
-    print(f"  pos_weight: {pos_weight_value:.2f}")
-
-    train_ds = TrustGateDataset(
-        data['X_s_train'], data['X_n_train'],
-        data['y_b_train'], data['y_c_train'], data['y_p_train'],
-    )
-    val_ds = TrustGateDataset(
-        data['X_s_val'], data['X_n_val'],
-        data['y_b_val'], data['y_c_val'], data['y_p_val'],
-    )
-
-    print(f"  Train: {len(train_ds):,}  Val: {len(val_ds):,}")
-
-    print(f"\n[2/5] Building DataLoaders (SHUFFLE, no sampler)...")
-    train_loader = DataLoader(
-        train_ds, batch_size=BATCH_SIZE,
-        shuffle=True,                    # ← KEY CHANGE
-        num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=BATCH_SIZE*2,
-        shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
-        drop_last=False,
-    )
-    print(f"  Train batches: {len(train_loader)}  Val batches: {len(val_loader)}")
-
-    print(f"\n[3/5] Building model...")
-    model = TrustGateModel().to(device)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"  Parameters: {total_params:,}")
-
-    print(f"\n[4/5] Building optimizer + losses...")
-    focal_loss    = FocalLossWithPosWeight(
-        gamma=FOCAL_GAMMA,
-        pos_weight=pos_weight_value
-    )
-    ce_loss       = nn.CrossEntropyLoss()
-    bce_comp_loss = nn.BCEWithLogitsLoss()
-    criterions = (focal_loss, ce_loss, bce_comp_loss)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY,
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5,
-        patience=7, min_lr=1e-6,
-    )
-    early_stop = EarlyStopping(patience=PATIENCE, min_delta=MIN_DELTA, path=CHECKPOINT)
-
-    print(f"  pos_weight   : {pos_weight_value:.2f}")
-    print(f"  Loss weights : binary={LOSS_WEIGHT_BINARY}  "
-          f"class={LOSS_WEIGHT_CLASS}  comp={LOSS_WEIGHT_COMP}")
-    print(f"  LR           : {LR}")
-    print(f"  Weight decay : {WEIGHT_DECAY}")
-    print(f"  Patience     : {PATIENCE}")
-
-    init_log(LOG_FILE)
-
-    print(f"\n[5/5] Training (max {EPOCHS} epochs)...")
-    print(f"\n  {'Ep':>3} | {'TLoss':>7} {'TBin':>6} {'TCls':>6} {'TCom':>6} | "
-          f"{'VLoss':>7} {'AUC':>6} {'F1':>6} {'Prec':>6} {'Rec':>6} "
-          f"{'CAcc':>6} {'CmpF1':>6} | {'LR':>9} {'Time':>5} {'Status'}")
-    print(f"  {'-'*135}")
-
-    for epoch in range(1, EPOCHS + 1):
-        t0 = time.time()
-
-        tr_loss = train_one_epoch(model, train_loader, criterions, optimizer, device)
-        val = evaluate(model, val_loader, criterions, device)
-
-        scheduler.step(val['val_f1'])
-        lr = optimizer.param_groups[0]['lr']
-
-        improved = early_stop(val[MONITOR], model, epoch, val)
-        status = "SAVED ✓" if improved else f"wait {early_stop.counter}/{PATIENCE}"
-
-        t_epoch = time.time() - t0
-        log_epoch(LOG_FILE, epoch, tr_loss, val, lr, t_epoch)
-
-        print(f"  {epoch:>3} | "
-              f"{tr_loss['total']:>7.4f} {tr_loss['bin']:>6.4f} "
-              f"{tr_loss['cls']:>6.4f} {tr_loss['comp']:>6.4f} | "
-              f"{val['loss']:>7.4f} {val['val_auc']:>6.4f} "
-              f"{val['val_f1']:>6.4f} {val['val_prec']:>6.4f} "
-              f"{val['val_recall']:>6.4f} {val['val_cls_acc']:>6.4f} "
-              f"{val['val_comp_f1']:>6.4f} | "
-              f"{lr:>9.2e} {t_epoch:>4.0f}s {status}")
-
-        if early_stop.stop:
-            print(f"\n  Early stopping at epoch {epoch}")
-            print(f"  Best val_f1: {early_stop.best:.4f}")
-            break
-
-    print(f"\n{'='*60}")
-    print(f"Training complete. Best val_f1: {early_stop.best:.4f}")
-    print(f"Checkpoint: {CHECKPOINT}")
-    print(f"{'='*60}")
-
-
-if __name__ == '__main__':
-    main()
+print(f"\n[6/6] Training complete")
+print(f"  Best val_auc : {best_auc:.4f}")
+print(f"  Checkpoint   : {SAVE_PATH}")
+print(f"  Log          : {LOG_PATH}")
+print(f"\n{'='*60}")
+print(f"Next: python 02_evaluate.py")
+print(f"{'='*60}")

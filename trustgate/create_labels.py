@@ -1,87 +1,131 @@
 """
-TrustGate — Multi-class Attack Stage Labeler
-Converts binary y (0/1) → 6-class labels
-Based on: Ahmed et al. (2017) SWaT attack descriptions
+TrustGate — Multi-class Attack Stage Labeler (v2)
+==================================================
+Reads attack names saved directly by 01_build_windows.py
+and maps them to 6-class labels — no sensor-deviation guessing.
+
+Attack name → class mapping mirrors merge_A12.py ATTACK_CLASSES.
+
+Classes:
+  0: NORMAL
+  1: VALVE_ATTACK   (Stage 5 Valve Manip/Repeat, RO Backwash)
+  2: PUMP_ATTACK    (Stage 1 Flow Disrupt, Stage 2 Parallel Pump)
+  3: CHEMICAL       (Florida Water Scenario)
+  4: LEVEL_SPOOF    (Tank Overflow LIT101/Repeat)
+  5: SENSOR_SPOOF   (Forced Backwash DPIT301, LIT601 Spoofing, AIT402 Spoof)
+
+Run: python create_labels.py
 """
+
 import numpy as np
 
+NPZ_IN  = 'trustgate_data/swat_final.npz'
+NPZ_OUT = 'trustgate_data/swat_multilabel.npz'
+
+# ── Attack name → integer class ───────────────────────────────────
 ATTACK_CLASSES = {
+    'NORMAL'                  : 0,
+    'Stage 5 Valve Manip'     : 1,
+    'Stage 5 Valve Repeat'    : 1,
+    'RO Backwash Diversion'   : 1,
+    'Stage 1 Flow Disrupt'    : 2,
+    'Stage 2 Parallel Pump'   : 2,
+    'Florida Water Scenario'  : 3,
+    'Tank Overflow LIT101'    : 4,
+    'Tank Overflow Repeat'    : 4,
+    'Forced Backwash DPIT301' : 5,
+    'LIT601 Spoofing'         : 5,
+    'AIT402 High Spoof'       : 5,
+}
+
+CLASS_NAMES = {
     0: 'NORMAL',
-    1: 'CHEMICAL',     # AIT202, AIT203, AIT501-504
-    2: 'PRESSURE',     # PIT501-503, DPIT301
-    3: 'FLOW_TAMPER',  # FIT101,201,301,401,501-504
-    4: 'PUMP_DOS',     # P-series actuators
-    5: 'VALVE_ATTACK'  # MV-series + LIT-series
+    1: 'VALVE_ATTACK',
+    2: 'PUMP_ATTACK',
+    3: 'CHEMICAL',
+    4: 'LEVEL_SPOOF',
+    5: 'SENSOR_SPOOF',
 }
 
-SENSOR_GROUPS = {
-    1: ['AIT202','AIT203','AIT501','AIT502','AIT503','AIT504'],
-    2: ['PIT501','PIT502','PIT503','DPIT301'],
-    3: ['FIT101','FIT201','FIT301','FIT401','FIT501','FIT502','FIT503','FIT504'],
-    4: ['P102','P202','P203','P204','P205','P206','P301','P302',
-        'P401','P402','P403','P404','P501','P502','P601','P602','P603'],
-    5: ['MV101','MV201','MV301','MV302','MV303','MV304','MV401',
-        'LIT101','LIT201','LIT301','LIT401','LIT501']
-}
 
-def label_attack_stages(X_s, y_binary, sensor_cols):
-    sensor_cols = list(sensor_cols)
-    y_multi     = np.zeros(len(y_binary), dtype=np.int64)
+def names_to_classes(names_arr, y_binary):
+    """
+    Convert array of attack name strings → integer class array.
+    Falls back to sensor-deviation logic only for truly unknown names.
+    """
+    y_multi = np.zeros(len(names_arr), dtype=np.int64)
+    unknown = []
 
-    # Normal baseline: mean of last timestep across all normal windows
-    normal_mean = X_s[y_binary == 0, -1, :].mean(axis=0)  # (44,)
+    for i, name in enumerate(names_arr):
+        name = str(name).strip()
+        if name in ATTACK_CLASSES:
+            y_multi[i] = ATTACK_CLASSES[name]
+        elif y_binary[i] == 1:
+            # Unknown attack name — default to class 1 and flag it
+            y_multi[i] = 1
+            unknown.append(name)
 
-    # Map sensor names → column indices
-    group_indices = {}
-    for cls, sensors in SENSOR_GROUPS.items():
-        idxs = [sensor_cols.index(s) for s in sensors if s in sensor_cols]
-        group_indices[cls] = idxs
-        print(f"  Class {cls} ({ATTACK_CLASSES[cls]}): {len(idxs)} sensors mapped")
-
-    # Assign class to each attack window
-    attack_idxs = np.where(y_binary == 1)[0]
-    print(f"\n  Labeling {len(attack_idxs):,} attack windows...")
-
-    for i in attack_idxs:
-        deviation  = np.abs(X_s[i, -1, :] - normal_mean)
-        best_cls   = 1
-        best_score = -1
-        for cls, idxs in group_indices.items():
-            if not idxs:
-                continue
-            score = deviation[idxs].mean()
-            if score > best_score:
-                best_score = score
-                best_cls   = cls
-        y_multi[i] = best_cls
+    if unknown:
+        unique_unknown = set(unknown)
+        print(f'  [WARN] {len(unknown)} windows had unknown attack names '
+              f'(defaulted to class 1): {unique_unknown}')
 
     return y_multi
 
 
-if __name__ == '__main__':
-    print("Loading swat_final.npz...")
-    data = np.load('trustgate_data/swat_final.npz', allow_pickle=True)
+def main():
+    print(f'Loading {NPZ_IN}...')
+    data = np.load(NPZ_IN, allow_pickle=True)
+
+    print(f'Keys: {list(data.keys())}\n')
+
     sensor_cols = data['sensor_cols']
-    print(f"Sensor columns ({len(sensor_cols)}): {list(sensor_cols)}\n")
+    print(f'Sensor columns ({len(sensor_cols)}): {list(sensor_cols)}\n')
+
+    # Check if attack names were saved
+    has_names = 'y_names_train' in data
+    if not has_names:
+        print('[WARN] y_names_train not found in NPZ.')
+        print('       Re-run 01_build_windows.py first to save attack names.')
+        print('       Falling back to binary labels only (all attacks = class 1).')
 
     splits = {}
     for split in ['train', 'val', 'test']:
-        print(f"[{split.upper()}] Creating stage labels...")
-        y_multi = label_attack_stages(
-            data[f'X_s_{split}'], data[f'y_{split}'], sensor_cols)
+        print(f'[{split.upper()}] Creating class labels...')
+
+        y_binary = data[f'y_{split}']
+
+        if has_names:
+            names = data[f'y_names_{split}']
+            y_multi = names_to_classes(names, y_binary)
+        else:
+            # Fallback: binary → 1 for all attacks
+            y_multi = y_binary.copy()
+
         splits[split] = y_multi
 
-        print(f"  Distribution:")
-        for cls, name in ATTACK_CLASSES.items():
-            count = (y_multi == cls).sum()
-            print(f"    Class {cls} ({name:>12}): {count:>8,}")
+        # Distribution report
+        print(f'  Distribution:')
+        for cls, name in CLASS_NAMES.items():
+            count = int((y_multi == cls).sum())
+            pct   = count / len(y_multi) * 100
+            bar   = '█' * int(pct / 2)
+            print(f'    Class {cls} ({name:>12}): {count:>7,}  ({pct:5.1f}%)  {bar}')
         print()
 
+    # ── Save ──────────────────────────────────────────────────────
     np.savez_compressed(
-        'trustgate_data/swat_multilabel.npz',
-        X_s_train=data['X_s_train'], X_n_train=data['X_n_train'], y_train=splits['train'],
-        X_s_val  =data['X_s_val'],   X_n_val  =data['X_n_val'],   y_val  =splits['val'],
-        X_s_test =data['X_s_test'],  X_n_test =data['X_n_test'],  y_test =splits['test'],
-        sensor_cols=sensor_cols
+        NPZ_OUT,
+        X_s_train=data['X_s_train'], X_n_train=data['X_n_train'],
+        y_train=splits['train'],
+        X_s_val  =data['X_s_val'],   X_n_val  =data['X_n_val'],
+        y_val  =splits['val'],
+        X_s_test =data['X_s_test'],  X_n_test =data['X_n_test'],
+        y_test =splits['test'],
+        sensor_cols=sensor_cols,
     )
-    print("[OK] Saved trustgate_data/swat_multilabel.npz")
+    print(f'[OK] Saved {NPZ_OUT}')
+
+
+if __name__ == '__main__':
+    main()

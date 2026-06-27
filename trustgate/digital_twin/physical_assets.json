@@ -1,0 +1,202 @@
+{
+  "plant_name": "SWaT-Based Water Treatment Plant",
+  "coordinate_unit": "meters",
+  "grid_size": {"x_max": 15, "y_max": 10},
+
+  "stages": {
+    "P1": "Raw Water Intake",
+    "P2": "Chemical Dosing",
+    "P3": "Ultrafiltration",
+    "P4": "Dechlorination",
+    "P5": "Reverse Osmosis",
+    "P6": "Permeate Storage"
+  },
+
+  "physical_assets": {
+    "40001": {
+      "component": "Pump P101",
+      "stage": "P1",
+      "type": "pump",
+      "description": "Raw water intake pump",
+      "coordinates": {"x": 1.5, "y": 5.0},
+      "safe_range": {"min": 0, "max": 1},
+      "unit": "on/off",
+      "affects": ["pipe_P1_T101", "tank_T101"],
+      "failure_consequence": "No raw water intake — plant starved",
+      "attack_effect": "Flood intake if left running with closed outlet",
+      "time_to_failure_seconds": 120,
+      "severity": "MEDIUM",
+      "remediation": "Close V1 inlet valve at (0.5, 5.0)"
+    },
+    "40002": {
+      "component": "Tank T101 Level",
+      "stage": "P1",
+      "type": "sensor",
+      "description": "Raw water storage tank level sensor",
+      "coordinates": {"x": 3.0, "y": 5.0},
+      "safe_range": {"min": 500, "max": 800},
+      "unit": "mm",
+      "affects": ["pump_P101", "valve_MV101"],
+      "failure_consequence": "Overflow or dry run condition",
+      "attack_effect": "Spoof level reading — pump runs dry or tank overflows",
+      "time_to_failure_seconds": 90,
+      "severity": "HIGH",
+      "remediation": "Manual level inspection at T101 (3.0m, 5.0m)"
+    },
+    "40003": {
+      "component": "Chemical Dosing Valve MV201",
+      "stage": "P2",
+      "type": "chemical_valve",
+      "description": "Controls NaOCl (sodium hypochlorite) dosing",
+      "coordinates": {"x": 8.7, "y": 2.3},
+      "safe_range": {"min": 0, "max": 1},
+      "unit": "on/off",
+      "affects": ["pipe_P2_chemical", "tank_T301", "distribution_main"],
+      "failure_consequence": "Chemical overdose — toxic water to consumers",
+      "attack_effect": "Force-open valve — NaOCl reaches 11100ppm (lethal above 1ppm drinking)",
+      "time_to_failure_seconds": 23,
+      "severity": "CATASTROPHIC",
+      "remediation": "Close emergency valve EV2 at (6.1m, 4.5m) IMMEDIATELY"
+    },
+    "40004": {
+      "component": "Pump P205",
+      "stage": "P2",
+      "type": "chemical_pump",
+      "description": "Chemical dosing injection pump",
+      "coordinates": {"x": 8.0, "y": 3.5},
+      "safe_range": {"min": 0, "max": 1},
+      "unit": "on/off",
+      "affects": ["valve_MV201", "pipe_P2_chemical"],
+      "failure_consequence": "No chemical treatment — unsafe water output",
+      "attack_effect": "Force-run pump with open MV201 — rapid overdose",
+      "time_to_failure_seconds": 15,
+      "severity": "CATASTROPHIC",
+      "remediation": "Cut power to P2 chemical stage at breaker CB2"
+    },
+    "40005": {
+      "component": "Pump P301",
+      "stage": "P3",
+      "type": "pump",
+      "description": "Ultrafiltration feed pump",
+      "coordinates": {"x": 5.0, "y": 4.0},
+      "safe_range": {"min": 0, "max": 1},
+      "unit": "on/off",
+      "affects": ["pipe_P3_feed", "tank_T301"],
+      "failure_consequence": "Ultrafiltration bypass — unfiltered water output",
+      "attack_effect": "Disable pump — T301 starved, backup pump P302 overloads",
+      "time_to_failure_seconds": 60,
+      "severity": "HIGH",
+      "remediation": "Enable backup pump P302 at (5.5m, 4.0m)"
+    },
+    "40006": {
+      "component": "Tank T301 Level",
+      "stage": "P3",
+      "type": "sensor",
+      "description": "Ultrafiltration tank level",
+      "coordinates": {"x": 6.5, "y": 5.0},
+      "safe_range": {"min": 500, "max": 1200},
+      "unit": "mm",
+      "affects": ["pump_P301", "pump_P302"],
+      "failure_consequence": "Overflow floods filtration stage",
+      "attack_effect": "Spoof high level reading — pumps shut off — real overflow",
+      "time_to_failure_seconds": 75,
+      "severity": "HIGH",
+      "remediation": "Manual valve MV302 close at (6.0m, 6.0m)"
+    },
+    "40007": {
+      "component": "Pressure Relief Valve PRV1",
+      "stage": "P5",
+      "type": "safety_valve",
+      "description": "High-pressure RO stage relief valve",
+      "coordinates": {"x": 12.1, "y": 6.8},
+      "safe_range": {"min": 1, "max": 1},
+      "unit": "on/off",
+      "affects": ["pipe_P5_high_pressure", "pump_P501", "pump_P502"],
+      "failure_consequence": "Pipe rupture in RO high-pressure zone",
+      "attack_effect": "Close PRV1 while P501/P502 running — pressure spike — pipe burst",
+      "time_to_failure_seconds": 8,
+      "severity": "CRITICAL",
+      "remediation": "Emergency stop pumps P501+P502 at (11.0m, 5.0m) NOW"
+    },
+    "40008": {
+      "component": "Pump P501",
+      "stage": "P5",
+      "type": "high_pressure_pump",
+      "description": "RO high-pressure pump — most dangerous component",
+      "coordinates": {"x": 11.0, "y": 5.0},
+      "safe_range": {"min": 0, "max": 1},
+      "unit": "on/off",
+      "affects": ["pipe_P5_high_pressure", "valve_PRV1"],
+      "failure_consequence": "Pressure buildup — pipe rupture",
+      "attack_effect": "Run P501 with PRV1 closed — 8 seconds to rupture",
+      "time_to_failure_seconds": 8,
+      "severity": "CRITICAL",
+      "remediation": "Emergency stop P501 immediately, open PRV1"
+    },
+    "40009": {
+      "component": "Tank T601 Level",
+      "stage": "P6",
+      "type": "sensor",
+      "description": "Permeate (clean water) storage tank",
+      "coordinates": {"x": 13.0, "y": 5.0},
+      "safe_range": {"min": 500, "max": 1000},
+      "unit": "mm",
+      "affects": ["pump_P602", "distribution_main"],
+      "failure_consequence": "No clean water supply to consumers",
+      "attack_effect": "Drain tank while spoofing full reading — distribution failure",
+      "time_to_failure_seconds": 180,
+      "severity": "MEDIUM",
+      "remediation": "Open bypass valve BV601 at (13.5m, 3.5m)"
+    },
+    "40010": {
+      "component": "Emergency Shutoff EV2",
+      "stage": "P2",
+      "type": "emergency_valve",
+      "description": "Master emergency shutoff for chemical stage",
+      "coordinates": {"x": 6.1, "y": 4.5},
+      "safe_range": {"min": 1, "max": 1},
+      "unit": "on/off",
+      "affects": ["valve_MV201", "pump_P205", "pipe_P2_chemical"],
+      "failure_consequence": "Chemical stage isolated — plant halts but safe",
+      "attack_effect": "Force-close EV2 during normal ops — chemical starvation",
+      "time_to_failure_seconds": 300,
+      "severity": "LOW",
+      "remediation": "This IS a remediation valve — closing it stops chemical attacks"
+    }
+  },
+
+  "attack_scenarios": {
+    "oldsmar_replay": {
+      "name": "Oldsmar 2021 Replay",
+      "sequence": ["40003", "40004"],
+      "description": "Chemical overdose attack matching 2021 Florida incident",
+      "target_registers": ["40003"],
+      "dangerous_value": 9999,
+      "detection_window_seconds": 23
+    },
+    "pressure_attack": {
+      "name": "RO Pipe Rupture Attack",
+      "sequence": ["40007", "40008"],
+      "description": "Close relief valve then run high-pressure pump",
+      "target_registers": ["40007", "40008"],
+      "dangerous_value": 0,
+      "detection_window_seconds": 8
+    },
+    "stealthy_drain": {
+      "name": "Slow Tank Drain",
+      "sequence": ["40009"],
+      "description": "Gradual sensor spoofing — below rule-based detection threshold",
+      "target_registers": ["40009"],
+      "dangerous_value": 1,
+      "detection_window_seconds": 180
+    }
+  },
+
+  "pipe_connections": [
+    {"id": "pipe_P1_T101",         "from": "40001", "to": "40002", "path": [[1.5,5.0],[3.0,5.0]]},
+    {"id": "pipe_P2_chemical",     "from": "40004", "to": "40003", "path": [[8.0,3.5],[8.7,2.3]]},
+    {"id": "pipe_P3_feed",         "from": "40005", "to": "40006", "path": [[5.0,4.0],[6.5,5.0]]},
+    {"id": "pipe_P5_high_pressure","from": "40008", "to": "40007", "path": [[11.0,5.0],[12.1,6.8]]},
+    {"id": "distribution_main",    "from": "40009", "to": "output", "path": [[13.0,5.0],[15.0,5.0]]}
+  ]
+}
